@@ -7,7 +7,11 @@ name: Release the Windows program
 #
 # How to release: tag a commit of `bakery-core` that is already merged into
 # `master`, then press "Run workflow" here and type the tag (for example v0.2.0).
-# The job waits for the owner's approval in the `release` environment.
+# Two jobs on purpose. `build` runs the program's code with no signing secret
+# and no approval gate, and hands over only the installer file. `sign` waits for
+# the owner's approval in the `release` environment, does not check out any
+# source, installs the signer by itself (no cache) and is the only place the
+# signing key exists.
 on:
   workflow_dispatch:
     inputs:
@@ -23,15 +27,11 @@ env:
   TAURI_CLI_VERSION: "2.12.6"
 
 jobs:
-  release:
-    # Only the workflow file on the default branch may run, so a changed copy
-    # on another branch cannot reach the secrets.
+  build:
+    # Only the workflow file on the default branch may run.
     if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 60
-    environment: release
-    permissions:
-      contents: write
     env:
       TAG: ${{ inputs.tag }}
     steps:
@@ -73,17 +73,11 @@ jobs:
             echo "::error::core/keys/license_public_key.txt has no valid public key line. Create the license key and merge it before releasing."
             exit 1
           fi
-      - name: Refuse a release with incomplete signing settings
+      - name: Refuse a release without an update public key
+        working-directory: src
         shell: bash
-        env:
-          # Only "true" or "false" is passed here, never the secret itself.
-          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
         run: |
-          if [ "$SIGNING_KEY" != "true" ]; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY is empty in the release environment."
-            exit 1
-          fi
-          if ! grep -q -E '"pubkey": *"[^"]+"' src/desktop/tauri.conf.json; then
+          if ! grep -q -E '"pubkey": *"[^"]+"' desktop/tauri.conf.json; then
             echo "::error::desktop/tauri.conf.json has no update public key."
             exit 1
           fi
@@ -125,15 +119,64 @@ jobs:
         run: |
           cargo tauri build --bundles nsis
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Hand over the installer
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: installer
+          path: src/desktop/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    # The signing key exists only here, and only after the owner approves.
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag name
+        shell: bash
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::The tag must look like v1.2.3 or v1.2.3-rc1."
+            exit 1
+          fi
+      - name: Refuse an empty signing key
+        shell: bash
+        env:
+          # Only "true" or "false" is passed here, never the secret itself.
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$SIGNING_KEY" != "true" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is empty in the release environment."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
+        with:
+          toolchain: "1.100.0"
+      - name: Install the signer (fresh, never from a cache)
+        # No source is checked out in this job, so no repository setting can
+        # change what is installed or run here.
+        shell: bash
+        run: cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked
+      - name: Get the installer
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: installer
+          path: installer
       - name: Sign the installer
         # The only step that sees the update signing key.
-        working-directory: src/desktop
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          installer=$(ls target/release/bundle/nsis/*-setup.exe)
+          installer=$(ls installer/*-setup.exe)
           cargo tauri signer sign "$installer"
           test -s "$installer.sig"
       - name: Publish the update
@@ -145,7 +188,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          installer=$(ls src/desktop/target/release/bundle/nsis/*-setup.exe)
+          installer=$(ls installer/*-setup.exe)
           name=$(basename "$installer")
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG/$name"
           jq -n \
