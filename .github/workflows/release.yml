@@ -1,0 +1,162 @@
+name: Release the Windows program
+
+# Builds, signs and publishes a release of the private `bakery-core` program.
+# It lives in this PUBLIC repository on purpose: the owner's approval before a
+# run and the protected secrets are available here, but not in a private
+# repository on the free plan.
+#
+# How to release: tag a commit of `bakery-core` that is already merged into
+# `master`, then press "Run workflow" here and type the tag (for example v0.2.0).
+# The job waits for the owner's approval in the `release` environment.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of bakery-core to release, for example v0.2.0 (a dash, as in v0.2.0-rc1, makes a test release)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAURI_CLI_VERSION: "2.12.6"
+
+jobs:
+  release:
+    # Only the workflow file on the default branch may run, so a changed copy
+    # on another branch cannot reach the secrets.
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag name
+        shell: bash
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::The tag must look like v1.2.3 or v1.2.3-rc1."
+            exit 1
+          fi
+      - name: Get the program source
+        # The only step that sees the read-only token for the private source.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bakery-managment/bakery-core
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.CORE_READ_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: src
+      - name: Refuse a release that is not on master
+        # A tag can be put on any commit. Only a commit already merged into
+        # master (so it went through review) may be released.
+        working-directory: src
+        shell: bash
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/master; then
+            echo "::error::The tagged commit is not on master. Merge it first, then tag it."
+            exit 1
+          fi
+      - name: Refuse a release without a license public key
+        # With an empty key the program rejects every license, so a customer
+        # who updated would be locked out at once.
+        working-directory: src
+        shell: bash
+        run: |
+          key=$(grep -v -E '^[[:space:]]*(#|$)' core/keys/license_public_key.txt | head -n 1 | tr -d '[:space:]' || true)
+          if ! [[ "$key" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+            echo "::error::core/keys/license_public_key.txt has no valid public key line. Create the license key and merge it before releasing."
+            exit 1
+          fi
+      - name: Refuse a release with incomplete signing settings
+        shell: bash
+        env:
+          # Only "true" or "false" is passed here, never the secret itself.
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$SIGNING_KEY" != "true" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is empty in the release environment."
+            exit 1
+          fi
+          if ! grep -q -E '"pubkey": *"[^"]+"' src/desktop/tauri.conf.json; then
+            echo "::error::desktop/tauri.conf.json has no update public key."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
+        with:
+          toolchain: "1.100.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            src -> target
+            src/desktop -> target
+      - name: Run the Windows-only tests (DPAPI, machine id values)
+        working-directory: src
+        run: cargo test -p bakery-windows-platform -- --nocapture
+      - name: Keep the Tauri build tool in the cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-tauri.exe
+          key: tauri-cli-${{ env.TAURI_CLI_VERSION }}-${{ runner.os }}
+      - name: Install the Tauri build tool
+        shell: bash
+        run: |
+          if [ ! -f ~/.cargo/bin/cargo-tauri.exe ]; then
+            cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked
+          fi
+      - name: Use the release tag as the program version
+        working-directory: src
+        shell: bash
+        run: |
+          version="${TAG#v}"
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$version\"/" desktop/tauri.conf.json
+          grep -n '"version"' desktop/tauri.conf.json
+      - name: Build the installer (no secret in this step)
+        # PowerShell on purpose: its PATH has the Perl that builds the bundled
+        # OpenSSL. The bash of the runner puts Git's smaller Perl first, which
+        # lacks modules and breaks that build.
+        working-directory: src/desktop
+        shell: pwsh
+        run: |
+          cargo tauri build --bundles nsis
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Sign the installer
+        # The only step that sees the update signing key.
+        working-directory: src/desktop
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          installer=$(ls target/release/bundle/nsis/*-setup.exe)
+          cargo tauri signer sign "$installer"
+          test -s "$installer.sig"
+      - name: Publish the update
+        # The program looks for `latest.json` on the newest release of this
+        # repository. A tag with a dash (for example v0.1.0-rc1) is a test
+        # release and is never served as "latest".
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          installer=$(ls src/desktop/target/release/bundle/nsis/*-setup.exe)
+          name=$(basename "$installer")
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG/$name"
+          jq -n \
+            --arg version "${TAG#v}" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat "$installer.sig")" \
+            --arg url "$url" \
+            '{version: $version, notes: "", pub_date: $date, platforms: {"windows-x86_64": {signature: $signature, url: $url}}}' \
+            > latest.json
+          flags=(--latest)
+          if [[ "$TAG" == *-* ]]; then flags=(--prerelease); fi
+          gh release create "$TAG" "$installer" latest.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --notes "Bakery $TAG" "${flags[@]}"
