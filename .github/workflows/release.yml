@@ -94,12 +94,18 @@ jobs:
         working-directory: src
         shell: bash
         run: |
-          version=$(tr -d '[:space:]' < frontend-version.txt)
+          version=$(sed -n 1p frontend-version.txt | tr -d '[:space:]')
+          commit=$(sed -n 2p frontend-version.txt | tr -d '[:space:]')
           if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::frontend-version.txt must hold a tag like v1.2.0."
+            echo "::error::frontend-version.txt line 1 must hold a tag like v1.2.1."
+            exit 1
+          fi
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::frontend-version.txt line 2 must hold the full commit of that tag."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - name: Get the frontend source
         # Same read-only token as the program source; nothing else uses it.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,6 +115,14 @@ jobs:
           token: ${{ secrets.CORE_READ_TOKEN }}
           persist-credentials: false
           path: frontend-src
+      - name: Check the frontend source is the pinned commit
+        shell: bash
+        run: |
+          actual=$(git -C frontend-src rev-parse HEAD)
+          if [ "$actual" != "${{ steps.frontend.outputs.commit }}" ]; then
+            echo "::error::Tag ${{ steps.frontend.outputs.version }} points at $actual, not the pinned commit. Refusing to build."
+            exit 1
+          fi
       - name: Build the frontend into the program
         # Node comes with the runner image.
         shell: bash
